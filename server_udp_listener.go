@@ -25,7 +25,7 @@ func (p *clientAddr) fill(ip net.IP, port int) {
 	}
 }
 
-func serverAllocateUDPListenerMulticastPair(
+func allocateUDPListenerMulticastPair(
 	listenPacket func(network, address string) (net.PacketConn, error),
 	writeTimeout time.Duration,
 	multicastRTPPort int,
@@ -124,8 +124,15 @@ func (u *serverUDPListener) port() int {
 func (u *serverUDPListener) run() {
 	defer close(u.done)
 
+	var buf []byte
+
+	createNewBuffer := func() {
+		buf = make([]byte, udpMaxPayloadSize+1)
+	}
+
+	createNewBuffer()
+
 	for {
-		buf := make([]byte, udpMaxPayloadSize+1)
 		n, addr2, err := u.pc.ReadFrom(buf)
 		if err != nil {
 			break
@@ -143,7 +150,9 @@ func (u *serverUDPListener) run() {
 				return
 			}
 
-			cb(buf[:n])
+			if cb(buf[:n]) {
+				createNewBuffer()
+			}
 		}()
 	}
 }

@@ -33,16 +33,22 @@ type Decoder struct {
 	// The number of bits in which the AU-Index-delta field is encoded in any non-first AU-header.
 	IndexDeltaLength int
 
-	firstAUParsed     bool
-	adtsMode          bool
-	fragments         [][]byte
-	fragmentsSize     int
-	fragmentsExpected int
+	firstAUParsed      bool
+	adtsMode           bool
+	fragments          [][]byte
+	fragmentsSize      int
+	fragmentsExpected  int
+	fragmentNextSeqNum uint16
 }
 
 // Init initializes the decoder.
 func (d *Decoder) Init() error {
 	return nil
+}
+
+func (d *Decoder) resetFragments() {
+	d.fragments = d.fragments[:0]
+	d.fragmentsSize = 0
 }
 
 // Decode decodes AUs from a RTP packet.

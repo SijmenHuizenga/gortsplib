@@ -10,14 +10,14 @@ import (
 
 func (d *Decoder) decodeGeneric(pkt *rtp.Packet) ([][]byte, error) {
 	if len(pkt.Payload) < 2 {
-		d.fragments = d.fragments[:0] // discard pending fragments
+		d.resetFragments()
 		return nil, fmt.Errorf("payload is too short")
 	}
 
 	// AU-headers-length (16 bits)
 	headersLen := int(uint16(pkt.Payload[0])<<8 | uint16(pkt.Payload[1]))
 	if headersLen == 0 {
-		d.fragments = d.fragments[:0] // discard pending fragments
+		d.resetFragments()
 		return nil, fmt.Errorf("invalid AU-headers-length")
 	}
 	payload := pkt.Payload[2:]
@@ -25,7 +25,7 @@ func (d *Decoder) decodeGeneric(pkt *rtp.Packet) ([][]byte, error) {
 	// AU-headers
 	dataLens, err := d.readAUHeaders(payload, headersLen)
 	if err != nil {
-		d.fragments = d.fragments[:0] // discard pending fragments
+		d.resetFragments()
 		return nil, err
 	}
 
@@ -37,7 +37,9 @@ func (d *Decoder) decodeGeneric(pkt *rtp.Packet) ([][]byte, error) {
 
 	var aus [][]byte
 
-	if len(d.fragments) == 0 {
+	if d.fragmentsSize == 0 {
+		d.resetFragments()
+
 		if pkt.Marker {
 			// AUs
 			aus = make([][]byte, len(dataLens))
@@ -60,35 +62,43 @@ func (d *Decoder) decodeGeneric(pkt *rtp.Packet) ([][]byte, error) {
 
 			d.fragmentsSize = int(dataLens[0])
 			d.fragments = append(d.fragments, payload[:dataLens[0]])
+			d.fragmentNextSeqNum = pkt.SequenceNumber + 1
 			return nil, ErrMorePacketsNeeded
 		}
 	} else {
 		// we are decoding a fragmented AU
 		if len(dataLens) != 1 {
-			d.fragments = d.fragments[:0] // discard pending fragments
+			d.resetFragments()
 			return nil, fmt.Errorf("a fragmented packet can only contain one AU")
 		}
 
 		if len(payload) < int(dataLens[0]) {
-			d.fragments = d.fragments[:0] // discard pending fragments
+			d.resetFragments()
 			return nil, fmt.Errorf("payload is too short")
 		}
 
+		if pkt.SequenceNumber != d.fragmentNextSeqNum {
+			d.resetFragments()
+			return nil, fmt.Errorf("discarding frame since a RTP packet is missing")
+		}
+
 		d.fragmentsSize += int(dataLens[0])
+
 		if d.fragmentsSize > mpeg4audio.MaxAccessUnitSize {
-			d.fragments = d.fragments[:0] // discard pending fragments
+			d.resetFragments()
 			return nil, fmt.Errorf("access unit size (%d) is too big, maximum is %d",
 				d.fragmentsSize, mpeg4audio.MaxAccessUnitSize)
 		}
 
 		d.fragments = append(d.fragments, payload[:dataLens[0]])
+		d.fragmentNextSeqNum++
 
 		if !pkt.Marker {
 			return nil, ErrMorePacketsNeeded
 		}
 
 		aus = [][]byte{joinFragments(d.fragments, d.fragmentsSize)}
-		d.fragments = d.fragments[:0]
+		d.resetFragments()
 	}
 
 	return d.removeADTS(aus)

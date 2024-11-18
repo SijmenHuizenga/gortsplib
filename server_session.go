@@ -23,7 +23,7 @@ import (
 	"github.com/bluenviron/gortsplib/v4/pkg/sdp"
 )
 
-type readFunc func([]byte)
+type readFunc func([]byte) bool
 
 func stringsReverseIndex(s, substr string) int {
 	for i := len(s) - 1 - len(substr); i >= 0; i-- {
@@ -34,50 +34,95 @@ func stringsReverseIndex(s, substr string) int {
 	return -1
 }
 
-func serverParseURLForPlay(u *base.URL) (string, string, string, error) {
-	pathAndQuery, ok := u.RTSPPathAndQuery()
-	if !ok {
-		return "", "", "", liberrors.ErrServerInvalidPath{}
-	}
-
-	i := stringsReverseIndex(pathAndQuery, "/trackID=")
-	if i < 0 {
-		if !strings.HasSuffix(pathAndQuery, "/") {
-			return "", "", "", liberrors.ErrServerPathNoSlash{}
+// used for all methods except SETUP
+func getPathAndQuery(u *base.URL, isAnnounce bool) (string, string) {
+	if !isAnnounce {
+		// FFmpeg format
+		if strings.HasSuffix(u.RawQuery, "/") {
+			return u.Path, u.RawQuery[:len(u.RawQuery)-1]
 		}
 
-		path, query := base.PathSplitQuery(pathAndQuery[:len(pathAndQuery)-1])
-		return path, query, "", nil
+		// GStreamer format
+		if len(u.Path) > 1 && strings.HasSuffix(u.Path, "/") {
+			return u.Path[:len(u.Path)-1], u.RawQuery
+		}
 	}
 
-	var trackID string
-	pathAndQuery, trackID = pathAndQuery[:i], pathAndQuery[i+len("/trackID="):]
-	path, query := base.PathSplitQuery(pathAndQuery)
-	return path, query, trackID, nil
+	return u.Path, u.RawQuery
 }
 
-func recordBaseURL(u *base.URL, path string, query string) *base.URL {
-	baseURL := &base.URL{
-		Scheme:   u.Scheme,
-		Host:     u.Host,
-		Path:     path,
-		RawQuery: query,
+// used for SETUP when playing
+func getPathAndQueryAndTrackID(u *base.URL) (string, string, string, error) {
+	// FFmpeg format
+	i := stringsReverseIndex(u.RawQuery, "/trackID=")
+	if i >= 0 {
+		path := u.Path
+		query := u.RawQuery[:i]
+		trackID := u.RawQuery[i+len("/trackID="):]
+		return path, query, trackID, nil
 	}
 
-	if baseURL.RawQuery != "" {
-		baseURL.RawQuery += "/"
-	} else {
-		baseURL.Path += "/"
+	// GStreamer format
+	i = stringsReverseIndex(u.Path, "/trackID=")
+	if i >= 0 {
+		path := u.Path[:i]
+		query := u.RawQuery
+		trackID := u.Path[i+len("/trackID="):]
+		return path, query, trackID, nil
 	}
 
-	return baseURL
+	// no track ID and a trailing slash.
+	// this happens when trying to read a MPEG-TS stream with FFmpeg.
+	if strings.HasSuffix(u.RawQuery, "/") {
+		return u.Path, u.RawQuery[:len(u.RawQuery)-1], "0", nil
+	}
+	if strings.HasSuffix(u.Path[1:], "/") {
+		return u.Path[:len(u.Path)-1], u.RawQuery, "0", nil
+	}
+
+	return "", "", "", liberrors.ErrServerPathNoSlash{}
 }
 
-func findMediaByURL(medias []*description.Media, baseURL *base.URL, u *base.URL) *description.Media {
+// used for SETUP when recording
+func findMediaByURL(
+	medias []*description.Media,
+	path string,
+	query string,
+	u *base.URL,
+) *description.Media {
 	for _, media := range medias {
-		u1, err := media.URL(baseURL)
-		if err == nil && u1.String() == u.String() {
-			return media
+		if strings.HasPrefix(media.Control, "rtsp://") ||
+			strings.HasPrefix(media.Control, "rtsps://") {
+			if media.Control == u.String() {
+				return media
+			}
+		} else {
+			// FFmpeg format
+			u1 := &base.URL{
+				Scheme:   u.Scheme,
+				Host:     u.Host,
+				Path:     path,
+				RawQuery: query,
+			}
+			if query != "" {
+				u1.RawQuery += "/" + media.Control
+			} else {
+				u1.Path += "/" + media.Control
+			}
+			if u1.String() == u.String() {
+				return media
+			}
+
+			// GStreamer format
+			u2 := &base.URL{
+				Scheme:   u.Scheme,
+				Host:     u.Host,
+				Path:     path + "/" + media.Control,
+				RawQuery: query,
+			}
+			if u2.String() == u.String() {
+				return media
+			}
 		}
 	}
 
@@ -202,7 +247,7 @@ type ServerSession struct {
 	udpLastPacketTime     *int64               // publish
 	udpCheckStreamTimer   *time.Timer
 	writer                asyncProcessor
-	timeDecoder           *rtptime.GlobalDecoder
+	timeDecoder           *rtptime.GlobalDecoder2
 
 	// in
 	chHandleRequest chan sessionRequestReq
@@ -503,21 +548,12 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 
 	var path string
 	var query string
+
 	switch req.Method {
-	case base.Announce, base.Play, base.Record, base.Pause, base.GetParameter, base.SetParameter:
-		pathAndQuery, ok := req.URL.RTSPPathAndQuery()
-		if !ok {
-			return &base.Response{
-				StatusCode: base.StatusBadRequest,
-			}, liberrors.ErrServerInvalidPath{}
-		}
-
-		// pathAndQuery can end with a slash due to Content-Base, remove it
-		if ss.state == ServerSessionStatePrePlay || ss.state == ServerSessionStatePlay {
-			pathAndQuery = strings.TrimSuffix(pathAndQuery, "/")
-		}
-
-		path, query = base.PathSplitQuery(pathAndQuery)
+	case base.Announce:
+		path, query = getPathAndQuery(req.URL, true)
+	case base.Pause, base.GetParameter, base.SetParameter, base.Play, base.Record:
+		path, query = getPathAndQuery(req.URL, false)
 	}
 
 	switch req.Method {
@@ -593,30 +629,6 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 			}, liberrors.ErrServerSDPInvalid{Err: err}
 		}
 
-		for _, medi := range desc.Medias {
-			var mediURL *base.URL
-			mediURL, err = medi.URL(req.URL)
-			if err != nil {
-				return &base.Response{
-					StatusCode: base.StatusBadRequest,
-				}, fmt.Errorf("unable to generate media URL")
-			}
-
-			mediPath, ok := mediURL.RTSPPathAndQuery()
-			if !ok {
-				return &base.Response{
-					StatusCode: base.StatusBadRequest,
-				}, fmt.Errorf("invalid media URL (%v)", mediURL)
-			}
-
-			if !strings.HasPrefix(mediPath, path) {
-				return &base.Response{
-						StatusCode: base.StatusBadRequest,
-					}, fmt.Errorf("invalid media path: must begin with '%s', but is '%s'",
-						path, mediPath)
-			}
-		}
-
 		res, err := ss.s.Handler.(ServerHandlerOnAnnounce).OnAnnounce(&ServerHandlerOnAnnounceCtx{
 			Session:     ss,
 			Conn:        sc,
@@ -649,15 +661,15 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 			}, err
 		}
 
-		var inTSH headers.Transports
-		err = inTSH.Unmarshal(req.Header["Transport"])
+		var transportHeaders headers.Transports
+		err = transportHeaders.Unmarshal(req.Header["Transport"])
 		if err != nil {
 			return &base.Response{
 				StatusCode: base.StatusBadRequest,
 			}, liberrors.ErrServerTransportHeaderInvalid{Err: err}
 		}
 
-		inTH := findFirstSupportedTransportHeader(ss.s, inTSH)
+		inTH := findFirstSupportedTransportHeader(ss.s, transportHeaders)
 		if inTH == nil {
 			return &base.Response{
 				StatusCode: base.StatusUnsupportedTransport,
@@ -665,9 +677,10 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 		}
 
 		var trackID string
+
 		switch ss.state {
 		case ServerSessionStateInitial, ServerSessionStatePrePlay: // play
-			path, query, trackID, err = serverParseURLForPlay(req.URL)
+			path, query, trackID, err = getPathAndQueryAndTrackID(req.URL)
 			if err != nil {
 				return &base.Response{
 					StatusCode: base.StatusBadRequest,
@@ -692,16 +705,26 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 				transport = TransportUDPMulticast
 			} else {
 				transport = TransportUDP
-
-				if inTH.ClientPorts == nil {
-					return &base.Response{
-						StatusCode: base.StatusBadRequest,
-					}, liberrors.ErrServerTransportHeaderNoClientPorts{}
-				}
 			}
 		} else {
 			transport = TransportTCP
+		}
 
+		if ss.setuppedTransport != nil && *ss.setuppedTransport != transport {
+			return &base.Response{
+				StatusCode: base.StatusBadRequest,
+			}, liberrors.ErrServerMediasDifferentProtocols{}
+		}
+
+		switch transport {
+		case TransportUDP:
+			if inTH.ClientPorts == nil {
+				return &base.Response{
+					StatusCode: base.StatusBadRequest,
+				}, liberrors.ErrServerTransportHeaderNoClientPorts{}
+			}
+
+		case TransportTCP:
 			if inTH.InterleavedIDs != nil {
 				if (inTH.InterleavedIDs[0] + 1) != inTH.InterleavedIDs[1] {
 					return &base.Response{
@@ -715,12 +738,6 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 					}, liberrors.ErrServerTransportHeaderInterleavedIDsInUse{}
 				}
 			}
-		}
-
-		if ss.setuppedTransport != nil && *ss.setuppedTransport != transport {
-			return &base.Response{
-				StatusCode: base.StatusBadRequest,
-			}, liberrors.ErrServerMediasDifferentProtocols{}
 		}
 
 		switch ss.state {
@@ -775,7 +792,7 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 		case ServerSessionStateInitial, ServerSessionStatePrePlay: // play
 			medi = findMediaByTrackID(stream.desc.Medias, trackID)
 		default: // record
-			medi = findMediaByURL(ss.announcedDesc.Medias, recordBaseURL(req.URL, path, query), req.URL)
+			medi = findMediaByURL(ss.announcedDesc.Medias, path, query, req.URL)
 		}
 
 		if medi == nil {
@@ -934,7 +951,7 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 		v := ss.s.timeNow().Unix()
 		ss.udpLastPacketTime = &v
 
-		ss.timeDecoder = rtptime.NewGlobalDecoder()
+		ss.timeDecoder = rtptime.NewGlobalDecoder2()
 
 		for _, sm := range ss.setuppedMedias {
 			sm.start()
@@ -1020,7 +1037,7 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 		v := ss.s.timeNow().Unix()
 		ss.udpLastPacketTime = &v
 
-		ss.timeDecoder = rtptime.NewGlobalDecoder()
+		ss.timeDecoder = rtptime.NewGlobalDecoder2()
 
 		for _, sm := range ss.setuppedMedias {
 			sm.start()
@@ -1242,7 +1259,23 @@ func (ss *ServerSession) WritePacketRTCP(medi *description.Media, pkt rtcp.Packe
 
 // PacketPTS returns the PTS of an incoming RTP packet.
 // It is computed by decoding the packet timestamp and sychronizing it with other tracks.
+//
+// Deprecated: replaced by PacketPTS2.
 func (ss *ServerSession) PacketPTS(medi *description.Media, pkt *rtp.Packet) (time.Duration, bool) {
+	sm := ss.setuppedMedias[medi]
+	sf := sm.formats[pkt.PayloadType]
+
+	v, ok := ss.timeDecoder.Decode(sf.format, pkt)
+	if !ok {
+		return 0, false
+	}
+
+	return multiplyAndDivide(time.Duration(v), time.Second, time.Duration(sf.format.ClockRate())), true
+}
+
+// PacketPTS2 returns the PTS of an incoming RTP packet.
+// It is computed by decoding the packet timestamp and sychronizing it with other tracks.
+func (ss *ServerSession) PacketPTS2(medi *description.Media, pkt *rtp.Packet) (int64, bool) {
 	sm := ss.setuppedMedias[medi]
 	sf := sm.formats[pkt.PayloadType]
 	return ss.timeDecoder.Decode(sf.format, pkt)

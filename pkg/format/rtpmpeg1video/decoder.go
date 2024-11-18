@@ -33,8 +33,9 @@ func joinFragments(fragments [][]byte, size int) []byte {
 // Decoder is a RTP/MPEG-1/2 Video decoder.
 // Specification: https://datatracker.ietf.org/doc/html/rfc2250
 type Decoder struct {
-	fragments     [][]byte
-	fragmentsSize int
+	fragments          [][]byte
+	fragmentsSize      int
+	fragmentNextSeqNum uint16
 
 	sliceBuffer     [][]byte
 	sliceBufferSize int
@@ -45,38 +46,38 @@ func (d *Decoder) Init() error {
 	return nil
 }
 
+func (d *Decoder) resetFragments() {
+	d.fragments = d.fragments[:0]
+	d.fragmentsSize = 0
+}
+
 func (d *Decoder) decodeSlice(pkt *rtp.Packet) ([]byte, error) {
 	if len(pkt.Payload) < 4 {
-		d.fragments = d.fragments[:0] // discard pending fragments
-		d.fragmentsSize = 0
+		d.resetFragments()
 		return nil, fmt.Errorf("payload is too short")
 	}
 
 	mbz := pkt.Payload[0] >> 3
 	if mbz != 0 {
-		d.fragments = d.fragments[:0] // discard pending fragments
-		d.fragmentsSize = 0
+		d.resetFragments()
 		return nil, fmt.Errorf("invalid MBZ: %v", mbz)
 	}
 
 	t := (pkt.Payload[0] >> 2) & 0x01
 	if t != 0 {
-		d.fragments = d.fragments[:0] // discard pending fragments
-		d.fragmentsSize = 0
+		d.resetFragments()
 		return nil, fmt.Errorf("MPEG-2 video-specific header extension is not supported yet")
 	}
 
 	an := pkt.Payload[2] >> 7
 	if an != 0 {
-		d.fragments = d.fragments[:0] // discard pending fragments
-		d.fragmentsSize = 0
+		d.resetFragments()
 		return nil, fmt.Errorf("AN not supported yet")
 	}
 
 	n := (pkt.Payload[2] >> 6) & 0x01
 	if n != 0 {
-		d.fragments = d.fragments[:0] // discard pending fragments
-		d.fragmentsSize = 0
+		d.resetFragments()
 		return nil, fmt.Errorf("N not supported yet")
 	}
 
@@ -88,9 +89,10 @@ func (d *Decoder) decodeSlice(pkt *rtp.Packet) ([]byte, error) {
 		return pkt.Payload[4:], nil
 
 	case b == 1:
-		d.fragments = d.fragments[:0] // discard pending fragments
+		d.fragments = d.fragments[:0]
 		d.fragments = append(d.fragments, pkt.Payload[4:])
 		d.fragmentsSize = len(pkt.Payload[4:])
+		d.fragmentNextSeqNum = pkt.SequenceNumber + 1
 		return nil, ErrMorePacketsNeeded
 
 	case e == 1:
@@ -98,12 +100,16 @@ func (d *Decoder) decodeSlice(pkt *rtp.Packet) ([]byte, error) {
 			return nil, ErrNonStartingPacketAndNoPrevious
 		}
 
+		if pkt.SequenceNumber != d.fragmentNextSeqNum {
+			d.resetFragments()
+			return nil, fmt.Errorf("discarding frame since a RTP packet is missing")
+		}
+
 		d.fragments = append(d.fragments, pkt.Payload[4:])
 		d.fragmentsSize += len(pkt.Payload[4:])
 
 		slice := joinFragments(d.fragments, d.fragmentsSize)
-		d.fragments = d.fragments[:0]
-		d.fragmentsSize = 0
+		d.resetFragments()
 		return slice, nil
 
 	default:
@@ -111,8 +117,14 @@ func (d *Decoder) decodeSlice(pkt *rtp.Packet) ([]byte, error) {
 			return nil, ErrNonStartingPacketAndNoPrevious
 		}
 
+		if pkt.SequenceNumber != d.fragmentNextSeqNum {
+			d.resetFragments()
+			return nil, fmt.Errorf("discarding frame since a RTP packet is missing")
+		}
+
 		d.fragments = append(d.fragments, pkt.Payload[4:])
 		d.fragmentsSize += len(pkt.Payload[4:])
+		d.fragmentNextSeqNum++
 		return nil, ErrMorePacketsNeeded
 	}
 }

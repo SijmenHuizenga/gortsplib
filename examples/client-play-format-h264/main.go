@@ -1,3 +1,5 @@
+//go:build cgo
+
 package main
 
 import (
@@ -78,7 +80,7 @@ func main() {
 	// called when a RTP packet arrives
 	c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
 		// decode timestamp
-		pts, ok := c.PacketPTS(medi, pkt)
+		pts, ok := c.PacketPTS2(medi, pkt)
 		if !ok {
 			log.Printf("waiting for timestamp")
 			return

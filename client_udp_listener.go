@@ -15,8 +15,8 @@ func int64Ptr(v int64) *int64 {
 	return &v
 }
 
-func randInRange(max int) (int, error) {
-	b := big.NewInt(int64(max + 1))
+func randInRange(maxVal int) (int, error) {
+	b := big.NewInt(int64(maxVal + 1))
 	n, err := rand.Int(rand.Reader, b)
 	if err != nil {
 		return 0, err
@@ -24,7 +24,7 @@ func randInRange(max int) (int, error) {
 	return int(n.Int64()), nil
 }
 
-func clientAllocateUDPListenerPair(c *Client) (*clientUDPListener, *clientUDPListener, error) {
+func allocateUDPListenerPair(c *Client) (*clientUDPListener, *clientUDPListener, error) {
 	// choose two consecutive ports in range 65535-10000
 	// RTP port must be even and RTCP port odd
 	for {
@@ -142,8 +142,15 @@ func (u *clientUDPListener) stop() {
 func (u *clientUDPListener) run() {
 	defer close(u.done)
 
+	var buf []byte
+
+	createNewBuffer := func() {
+		buf = make([]byte, udpMaxPayloadSize+1)
+	}
+
+	createNewBuffer()
+
 	for {
-		buf := make([]byte, udpMaxPayloadSize+1)
 		n, addr, err := u.pc.ReadFrom(buf)
 		if err != nil {
 			return
@@ -166,7 +173,9 @@ func (u *clientUDPListener) run() {
 		now := u.c.timeNow()
 		atomic.StoreInt64(u.lastPacketTime, now.Unix())
 
-		u.readFunc(buf[:n])
+		if u.readFunc(buf[:n]) {
+			createNewBuffer()
+		}
 	}
 }
 

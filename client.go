@@ -31,6 +31,14 @@ import (
 	"github.com/bluenviron/gortsplib/v4/pkg/sdp"
 )
 
+// avoid an int64 overflow and preserve resolution by splitting division into two parts:
+// first add the integer part, then the decimal part.
+func multiplyAndDivide(v, m, d time.Duration) time.Duration {
+	secs := v / d
+	dec := v % d
+	return (secs*m + dec*m/d)
+}
+
 // convert an URL into an address, in particular:
 // * add default port
 // * handle IPv6 with or without square brackets.
@@ -73,6 +81,19 @@ func findBaseURL(sd *sdp.SessionDescription, res *base.Response, u *base.URL) (*
 	if cb, ok := res.Header["Content-Base"]; ok {
 		if len(cb) != 1 {
 			return nil, fmt.Errorf("invalid Content-Base: '%v'", cb)
+		}
+
+		if strings.HasPrefix(cb[0], "/") {
+			// parse as a relative path
+			ret, err := base.ParseURL(u.Scheme + "://" + u.Host + cb[0])
+			if err != nil {
+				return nil, fmt.Errorf("invalid Content-Base: '%v'", cb)
+			}
+
+			// add credentials
+			ret.User = u.User
+
+			return ret, nil
 		}
 
 		ret, err := base.ParseURL(cb[0])
@@ -320,7 +341,7 @@ type Client struct {
 	closeError           error
 	writer               asyncProcessor
 	reader               *clientReader
-	timeDecoder          *rtptime.GlobalDecoder
+	timeDecoder          *rtptime.GlobalDecoder2
 	mustClose            bool
 
 	// in
@@ -808,7 +829,7 @@ func (c *Client) startReadRoutines() {
 		c.writer.allocateBuffer(8)
 	}
 
-	c.timeDecoder = rtptime.NewGlobalDecoder()
+	c.timeDecoder = rtptime.NewGlobalDecoder2()
 
 	for _, cm := range c.medias {
 		cm.start()
@@ -1298,9 +1319,8 @@ func (c *Client) doSetup(
 				v := headers.TransportModeRecord
 				return &v
 			}
-
-			v := headers.TransportModePlay
-			return &v
+			// when playing, omit mode, since it causes errors with some servers.
+			return nil
 		}(),
 	}
 
@@ -1890,7 +1910,23 @@ func (c *Client) WritePacketRTCP(medi *description.Media, pkt rtcp.Packet) error
 
 // PacketPTS returns the PTS of an incoming RTP packet.
 // It is computed by decoding the packet timestamp and sychronizing it with other tracks.
+//
+// Deprecated: replaced by PacketPTS2.
 func (c *Client) PacketPTS(medi *description.Media, pkt *rtp.Packet) (time.Duration, bool) {
+	cm := c.medias[medi]
+	ct := cm.formats[pkt.PayloadType]
+
+	v, ok := c.timeDecoder.Decode(ct.format, pkt)
+	if !ok {
+		return 0, false
+	}
+
+	return multiplyAndDivide(time.Duration(v), time.Second, time.Duration(ct.format.ClockRate())), true
+}
+
+// PacketPTS2 returns the PTS of an incoming RTP packet.
+// It is computed by decoding the packet timestamp and sychronizing it with other tracks.
+func (c *Client) PacketPTS2(medi *description.Media, pkt *rtp.Packet) (int64, bool) {
 	cm := c.medias[medi]
 	ct := cm.formats[pkt.PayloadType]
 	return c.timeDecoder.Decode(ct.format, pkt)

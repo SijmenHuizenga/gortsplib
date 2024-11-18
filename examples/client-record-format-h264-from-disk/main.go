@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
 	"log"
 	"os"
@@ -9,7 +10,6 @@ import (
 	"github.com/bluenviron/gortsplib/v4"
 	"github.com/bluenviron/gortsplib/v4/pkg/description"
 	"github.com/bluenviron/gortsplib/v4/pkg/format"
-	"github.com/bluenviron/gortsplib/v4/pkg/rtptime"
 	"github.com/bluenviron/mediacommon/pkg/formats/mpegts"
 )
 
@@ -26,6 +26,15 @@ func findTrack(r *mpegts.Reader) (*mpegts.Track, error) {
 		}
 	}
 	return nil, fmt.Errorf("H264 track not found")
+}
+
+func randUint32() (uint32, error) {
+	var b [4]byte
+	_, err := rand.Read(b[:])
+	if err != nil {
+		return 0, err
+	}
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]), nil
 }
 
 func main() {
@@ -74,18 +83,20 @@ func main() {
 		panic(err)
 	}
 
-	// setup RTP timestamp generator
-	rtpTime := &rtptime.Encoder{ClockRate: forma.ClockRate()}
-	err = rtpTime.Initialize()
+	randomStart, err := randUint32()
 	if err != nil {
 		panic(err)
 	}
 
+	timeDecoder := mpegts.NewTimeDecoder2()
 	var firstDTS *int64
 	var startTime time.Time
 
 	// setup a callback that is called whenever a H264 access unit is read from the file
 	r.OnDataH264(track, func(pts, dts int64, au [][]byte) error {
+		dts = timeDecoder.Decode(dts)
+		pts = timeDecoder.Decode(pts)
+
 		// sleep between access units
 		if firstDTS != nil {
 			timeDrift := time.Duration(dts-*firstDTS)*time.Second/90000 - time.Since(startTime)
@@ -105,10 +116,11 @@ func main() {
 			return err
 		}
 
-		// set timestamp
-		rtpTime := rtpTime.Encode(time.Duration(pts) * time.Second / 90000)
+		// set packet timestamp
+		// we don't have to perform any conversion
+		// since H264 clock rate is the same in both MPEG-TS and RTSP
 		for _, packet := range packets {
-			packet.Timestamp = rtpTime
+			packet.Timestamp = randomStart + uint32(pts)
 		}
 
 		// write packets to the server
